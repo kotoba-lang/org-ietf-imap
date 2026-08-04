@@ -39,11 +39,23 @@ tested the same way (`test/imap/fake_transport.cljc`, a scripted in-memory
 `Transport`) -- never only against a live server.
 
 **Scope, deliberately narrow**: LOGIN (plaintext user/pass, e.g. an app
-password), SELECT, UID SEARCH UNSEEN, UID FETCH of a header-fields literal,
-UID STORE flags, LOGOUT. It does not implement IDLE, general MIME body
-parsing, SASL mechanisms beyond plaintext LOGIN, or arbitrary FETCH data
-items -- this is the shape a triage/ingest use case needs, not a
-general-purpose mail library.
+password), SELECT, UID SEARCH (any criteria), UID FETCH of a header-fields
+literal *or of a whole message*, UID STORE flags both ways, LOGOUT. It does
+not implement IDLE, MIME multipart parsing, SASL mechanisms beyond plaintext
+LOGIN, or arbitrary FETCH data items.
+
+Whole-message reads (`fetch-message!`, `list-recent!`) were added for
+`cloud-itonami/cloud-itonami-app`, which displays a mailbox rather than
+triaging one: `fetch-header!` answers who a message is from and what it is
+about, and never what it says. `fetch-message!` returns `:headers`, the raw
+`:body`, and `:text` — the body with its `Content-Transfer-Encoding` undone
+(quoted-printable and base64, decoded over the whole byte sequence so
+multi-byte characters survive).
+
+**A multipart body is still returned raw**, boundaries and all. Selecting
+the text part out of a multipart tree is MIME parsing, which is on the
+not-implemented list above, and returning the first part would be doing it
+badly rather than not doing it.
 
 ## Usage
 
@@ -57,7 +69,16 @@ general-purpose mail library.
 (client/list-unseen-headers! session {:limit 20})
 ;; => [{:from "..." :subject "..." :date "..." :message-id "..." :uid 5} ...]
 
+;; Displaying a mailbox rather than triaging one: the newest N messages,
+;; bodies included, oldest of those first.
+(client/list-recent! session {:limit 40})
+;; => [{:uid 5 :headers {:from "..." :subject "..."} :body "..." :text "..." :raw "..."} ...]
+
+(client/fetch-message! session 5)          ; one whole message, BODY.PEEK
+(client/search! session "SINCE 1-Jan-2026") ; any RFC 3501 search key
+
 (client/mark-seen! session 5)   ; after a decision has actually been made on message 5
+(client/mark-unseen! session 5) ; and back again
 (client/logout! session)
 ```
 
