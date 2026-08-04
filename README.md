@@ -59,6 +59,21 @@ UID names a different message, or none, silently.
 COMPRESS, BODYSTRUCTURE/ENVELOPE parsing, sequence-number (non-UID) commands,
 SASL mechanisms beyond PLAIN and XOAUTH2.
 
+### Reads are binary strings
+
+Everything this library reads off the wire is decoded **ISO-8859-1**, one
+byte per character, which is exactly the input contract `org-ietf-mime`
+states. A message is bytes and its parts routinely disagree about what those
+bytes mean — a UTF-8 body beside an ISO-2022-JP subject beside a PDF — so
+decoding a literal as UTF-8 destroys every part that was not UTF-8, quietly,
+producing U+FFFD rather than an error. This transport did decode as UTF-8;
+the symptom was a Japanese body arriving as mojibake that looked like a bug
+in the MIME parser two libraries away.
+
+Command writes stay UTF-8: a command is text this library composed, not
+bytes it received. `append!`'s literal length is therefore a UTF-8 byte
+count.
+
 **Messages are not parsed here.** `fetch-message!` returns the bytes the
 server sent, and [`kotoba-lang/org-ietf-mime`](https://github.com/kotoba-lang/org-ietf-mime)
 turns those into headers, parts, attachments and decoded text:
