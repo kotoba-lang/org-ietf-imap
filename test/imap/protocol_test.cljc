@@ -44,53 +44,94 @@
     (let [block "Subject: line one\r\n line two\r\n\r\n"]
       (is (= "line one line two" (:subject (p/parse-header-block block)))))))
 
-;; --- whole-message reads (fetch-message! / list-recent!) --------------------
+;; --- untagged responses (RFC 3501 §7) --------------------------------------
 
-(deftest split-message-separates-headers-from-body-at-the-first-blank-line
-  (let [raw "From: a@example.com\r\nSubject: hi\r\n\r\nthe body\r\nsecond line\r\n"
-        {:keys [headers body]} (p/split-message raw)]
-    (is (= {:from "a@example.com" :subject "hi"} headers))
-    (is (= "the body\nsecond line\n" body))))
+(deftest parse-flags-normalises-system-and-keyword-flags
+  (is (= #{:seen :flagged} (p/parse-flags "(\\Seen \\Flagged)")))
+  (testing "case-insensitive per §2.3.2 -- two clients disagreeing about
+            \\SEEN vs \\Seen is a bug that shows up against one server only"
+    (is (= #{:seen} (p/parse-flags "(\\SEEN)"))))
+  (testing "a server-defined keyword keeps its $ and takes no backslash"
+    (is (= #{:$forwarded :seen} (p/parse-flags "(\\Seen $Forwarded)"))))
+  (is (= #{} (p/parse-flags "()"))))
 
-(deftest split-message-treats-a-bodyless-message-as-an-empty-body
-  (testing "no blank line means every line is a header, which is what a
-            bodyless message is -- not a parse failure"
-    (let [{:keys [headers body]} (p/split-message "From: a@example.com\r\nSubject: hi\r\n")]
-      (is (= {:from "a@example.com" :subject "hi"} headers))
-      (is (= "" body)))))
+(deftest response-code-reads-the-bracketed-code
+  (is (= {:code :uidvalidity :value "3857529045"}
+         (p/response-code "* OK [UIDVALIDITY 3857529045] UIDs valid")))
+  (is (= :read-only (:code (p/response-code "A2 OK [READ-ONLY] EXAMINE done"))))
+  (is (nil? (p/response-code "* 3 EXISTS"))))
 
-(deftest split-message-keeps-blank-lines-inside-the-body
-  (testing "only the FIRST blank line splits: a body with paragraphs must not
-            lose everything after its first one"
-    (is (= "one\n\ntwo\n"
-           (:body (p/split-message "Subject: s\r\n\r\none\r\n\r\ntwo\r\n"))))))
+(deftest parse-untagged-reads-counts-flags-and-capabilities
+  (is (= {:type :exists :value 172} (p/parse-untagged "* 172 EXISTS")))
+  (is (= {:type :recent :value 1} (p/parse-untagged "* 1 RECENT")))
+  (is (= {:type :expunge :value 12} (p/parse-untagged "* 12 EXPUNGE")))
+  (is (= {:type :flags :value #{:answered :flagged :seen}}
+         (p/parse-untagged "* FLAGS (\\Answered \\Flagged \\Seen)")))
+  (is (= #{"IMAP4REV1" "IDLE" "AUTH=PLAIN"}
+         (:value (p/parse-untagged "* CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN")))))
 
-(deftest decode-body-undoes-quoted-printable-including-soft-line-breaks
-  (is (= "日本語 text"
-         (p/decode-body
-          {:headers {:content-transfer-encoding "quoted-printable"}
-           :body "=E6=97=A5=E6=9C=AC=E8=AA=9E te=\nxt"}))))
+(deftest parse-untagged-tolerates-what-it-does-not-model
+  (testing "§7 requires a client to accept untagged responses it did not
+            request and cannot interpret -- returning nil is how a caller
+            folds what it knows and ignores the rest without a branch"
+    (is (nil? (p/parse-untagged "* SOMETHING ENTIRELY NEW")))
+    (is (nil? (p/parse-untagged "A1 OK not untagged at all")))))
 
-#?(:clj
-(deftest decode-body-undoes-base64
-  (is (= "hello" (p/decode-body {:headers {:content-transfer-encoding "base64"}
-                                 :body "aGVsbG8="})))))
+(deftest parse-untagged-reads-a-list-response
+  (let [parsed (p/parse-untagged "* LIST (\\HasNoChildren \\Sent) \"/\" \"INBOX/Sent\"")]
+    (is (= :list (:type parsed)))
+    (is (= "INBOX/Sent" (:name parsed)))
+    (is (= "/" (:delimiter parsed)))
+    (testing "RFC 6154 special-use, which is how a client finds Sent without
+              guessing at its name in the account's language"
+      (is (contains? (:attributes parsed) :sent)))))
 
-(deftest decode-body-passes-through-unencoded-and-unknown-encodings
-  (is (= "plain" (p/decode-body {:headers {} :body "plain"})))
-  (is (= "plain" (p/decode-body {:headers {:content-transfer-encoding "7bit"}
-                                 :body "plain"}))))
+(deftest parse-untagged-reads-a-status-response
+  (is (= {:messages 231 :uidnext 44292}
+         (:value (p/parse-untagged "* STATUS \"INBOX\" (MESSAGES 231 UIDNEXT 44292)")))))
 
-(deftest decode-body-leaves-multipart-raw-rather-than-half-parsing-it
-  (testing "picking the text part out of a multipart tree is MIME parsing,
-            which this library says it does not do -- returning the first part
-            would be doing it badly rather than not doing it"
-    (let [body "--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n--b--\r\n"]
-      (is (= body (p/decode-body
-                   {:headers {:content-type "multipart/alternative; boundary=b"
-                              :content-transfer-encoding "7bit"}
-                    :body body}))))))
+(deftest parse-untagged-reads-fetch-metadata
+  (let [parsed (p/parse-untagged
+                "* 12 FETCH (UID 5 FLAGS (\\Seen) RFC822.SIZE 4242 INTERNALDATE \"17-Jul-2026 02:44:25 +0900\")")]
+    (is (= 12 (:sequence parsed)))
+    (is (= 5 (:uid parsed)))
+    (is (= #{:seen} (:flags parsed)))
+    (is (= 4242 (:size parsed)))
+    (is (= "17-Jul-2026 02:44:25 +0900" (:internal-date parsed)))))
 
-(deftest content-type-drops-parameters-and-normalises-case
-  (is (= "text/plain" (p/content-type {:content-type "Text/Plain; charset=\"UTF-8\""})))
-  (is (nil? (p/content-type {}))))
+(deftest mailbox-state-keeps-uidvalidity
+  (testing "RFC 3501 §2.3.1.1: a UID means nothing without the UIDVALIDITY it
+            was issued under. A client that caches UIDs and drops this is
+            correct until the day a server reissues it, after which every
+            stored UID names a different message -- silently"
+    (let [state (p/mailbox-state
+                 ["* 172 EXISTS"
+                  "* 1 RECENT"
+                  "* FLAGS (\\Answered \\Seen)"
+                  "* OK [UIDVALIDITY 3857529045] UIDs valid"
+                  "* OK [UIDNEXT 4392] Predicted next UID"
+                  "* OK [PERMANENTFLAGS (\\Seen \\Deleted)] Limited"
+                  "* OK [UNSEEN 12] Message 12 is first unseen"])]
+      (is (= 3857529045 (:uidvalidity state)))
+      (is (= 4392 (:uidnext state)))
+      (is (= 172 (:exists state)))
+      (is (= 1 (:recent state)))
+      (is (= 12 (:unseen state)))
+      (is (= #{:answered :seen} (:flags state)))
+      (is (= #{:seen :deleted} (:permanent-flags state))))))
+
+;; --- SASL ------------------------------------------------------------------
+
+(deftest plain-credentials-carry-the-empty-authorization-identity
+  (testing "RFC 4616. Omitting the leading NUL field is the classic PLAIN bug
+            and servers reject it with a message naming none of the three"
+    (is (= (str (char 0) "me@example.com" (char 0) "secret")
+           (p/plain-credentials "me@example.com" "secret")))))
+
+(deftest xoauth2-credentials-have-the-shape-google-accepts
+  (is (= (str "user=me@example.com" (char 0) "auth=Bearer ya29.token"
+              (char 0) (char 0))
+         (p/xoauth2-credentials "me@example.com" "ya29.token"))))
+
+(deftest base64-round-trips-a-payload-with-nul-bytes
+  (is (= "AG1lAHB3" (p/base64 (p/plain-credentials "me" "pw")))))

@@ -38,24 +38,40 @@ read-until-tagged-completion loop over an injected `Transport`, so it's
 tested the same way (`test/imap/fake_transport.cljc`, a scripted in-memory
 `Transport`) -- never only against a live server.
 
-**Scope, deliberately narrow**: LOGIN (plaintext user/pass, e.g. an app
-password), SELECT, UID SEARCH (any criteria), UID FETCH of a header-fields
-literal *or of a whole message*, UID STORE flags both ways, LOGOUT. It does
-not implement IDLE, MIME multipart parsing, SASL mechanisms beyond plaintext
-LOGIN, or arbitrary FETCH data items.
+## RFC 3501 coverage
 
-Whole-message reads (`fetch-message!`, `list-recent!`) were added for
-`cloud-itonami/cloud-itonami-app`, which displays a mailbox rather than
-triaging one: `fetch-header!` answers who a message is from and what it is
-about, and never what it says. `fetch-message!` returns `:headers`, the raw
-`:body`, and `:text` — the body with its `Content-Transfer-Encoding` undone
-(quoted-printable and base64, decoded over the whole byte sequence so
-multi-byte characters survive).
+| area | commands |
+|---|---|
+| session | CAPABILITY, STARTTLS (injected upgrade), LOGIN, AUTHENTICATE PLAIN / XOAUTH2, LOGOUT |
+| mailboxes | SELECT, EXAMINE, LIST, STATUS, CREATE |
+| reading | UID SEARCH (any criteria), UID FETCH — header fields, whole message, FLAGS / INTERNALDATE / RFC822.SIZE |
+| writing | UID STORE (`+FLAGS`/`-FLAGS`/`FLAGS`, any flag), UID COPY, UID MOVE (RFC 6851, with COPY+`\Deleted` fallback), EXPUNGE, APPEND |
+| waiting | IDLE (RFC 2177) |
+| responses | untagged EXISTS / RECENT / EXPUNGE / FLAGS / CAPABILITY / LIST / STATUS / FETCH, `[response codes]`, flag lists |
 
-**A multipart body is still returned raw**, boundaries and all. Selecting
-the text part out of a multipart tree is MIME parsing, which is on the
-not-implemented list above, and returning the first part would be doing it
-badly rather than not doing it.
+**`SELECT` returns UIDVALIDITY** (RFC 3501 §2.3.1.1), which is the one a
+client cannot afford to drop: a UID means nothing without the UIDVALIDITY it
+was issued under, so a client that caches UIDs across sessions and never reads
+it is correct right up until a server reissues one — after which every stored
+UID names a different message, or none, silently.
+
+**Not implemented**: CONDSTORE/QRESYNC, NAMESPACE, ACL, SORT/THREAD, BINARY,
+COMPRESS, BODYSTRUCTURE/ENVELOPE parsing, sequence-number (non-UID) commands,
+SASL mechanisms beyond PLAIN and XOAUTH2.
+
+**Messages are not parsed here.** `fetch-message!` returns the bytes the
+server sent, and [`kotoba-lang/org-ietf-mime`](https://github.com/kotoba-lang/org-ietf-mime)
+turns those into headers, parts, attachments and decoded text:
+
+```clojure
+(-> (client/fetch-message! session 5) :raw mime/parse mime/message-parts)
+```
+
+For one commit this library carried its own `split-message` and
+transfer-encoding decoder instead — a second, worse copy of a library that
+already existed in this org, and one that got multipart wrong (it returned the
+raw parts) where `mime.parse` gets it right: `multipart/alternative` orders its
+parts worst-to-best, so the *last* match is the message somebody actually sent.
 
 ## Usage
 
@@ -72,14 +88,28 @@ badly rather than not doing it.
 ;; Displaying a mailbox rather than triaging one: the newest N messages,
 ;; bodies included, oldest of those first.
 (client/list-recent! session {:limit 40})
-;; => [{:uid 5 :headers {:from "..." :subject "..."} :body "..." :text "..." :raw "..."} ...]
+;; => [{:uid 5 :raw "From: ..." :flags #{:seen} :size 4242} ...]
+;;    parse :raw with org-ietf-mime
 
-(client/fetch-message! session 5)          ; one whole message, BODY.PEEK
+(client/fetch-message! session 5)           ; one whole message, BODY.PEEK
 (client/search! session "SINCE 1-Jan-2026") ; any RFC 3501 search key
 
 (client/mark-seen! session 5)   ; after a decision has actually been made on message 5
-(client/mark-unseen! session 5) ; and back again
+(client/store-flags! session 5 :add [:flagged])  ; any flag, all three modes
 (client/logout! session)
+```
+
+An OAuth-connected mailbox, with the folders and the Sent copy:
+
+```clojure
+(-> (client/connect! "imap.gmail.com")
+    (client/capabilities!)
+    (client/authenticate-xoauth2! "you@gmail.com" access-token)
+    (client/examine! "INBOX"))          ; read-only: cannot set \Seen by accident
+;; => session, with :mailbox {:uidvalidity 3857529045 :uidnext 4392 :exists 172 ...}
+
+(client/list-mailboxes! session)         ; \Sent is found, not guessed at
+(client/append! session "[Gmail]/Sent Mail" raw-message {:flags [:seen]})
 ```
 
 ## Tests
