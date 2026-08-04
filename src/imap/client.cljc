@@ -66,11 +66,32 @@
   (assert-ok! (run-command! session "SELECT" (p/quote-string mailbox)) "SELECT")
   session)
 
+(defn search!
+  "UID SEARCH `criteria` -> a vector of UIDs (longs), possibly empty.
+
+  `criteria` is raw IMAP search-key text (\"ALL\", \"UNSEEN\",
+  \"SINCE 1-Jan-2026\", \"FROM \\\"a@b\\\"\"). Passed through rather than
+  modelled: RFC 3501's search grammar is large, and a partial model of it
+  would be a vocabulary a caller has to learn *and* work around."
+  [session criteria]
+  (let [resp (assert-ok! (run-command! session "UID SEARCH" criteria) "UID SEARCH")]
+    (or (some p/search-uids (:lines resp)) [])))
+
 (defn search-unseen!
   "UID SEARCH UNSEEN -> a vector of UIDs (longs), possibly empty."
   [session]
-  (let [resp (assert-ok! (run-command! session "UID SEARCH" "UNSEEN") "UID SEARCH")]
-    (or (some p/search-uids (:lines resp)) [])))
+  (search! session "UNSEEN"))
+
+(defn search-all!
+  "UID SEARCH ALL -> every UID in the selected mailbox, ascending.
+
+  The whole mailbox rather than a page of it, because IMAP has no cursor:
+  UID SEARCH is how a client learns what exists, and the paging happens
+  afterwards on the returned UIDs (see `list-recent!`, which takes the tail).
+  This is a list of integers, not of messages -- the expensive call is the
+  per-UID fetch that follows, and that one is bounded."
+  [session]
+  (search! session "ALL"))
 
 (defn fetch-header!
   "UID FETCH `uid`'s header, limited to `fields` (default FROM SUBJECT
@@ -94,12 +115,64 @@
                           :uid uid))
          (take limit (search-unseen! session)))))
 
+(defn fetch-message!
+  "UID FETCH `uid`'s whole message -> `{:uid :headers {...} :body \"...\"
+  :text \"...\" :raw \"...\"}`.
+
+  `:body` is the body as it arrived; `:text` is that body with its
+  `Content-Transfer-Encoding` undone (see `imap.protocol/decode-body`,
+  including what it does *not* do for multipart). `:raw` is kept because a
+  caller archiving the message wants what the server actually sent, not this
+  library's reading of it.
+
+  BODY.PEEK, like `fetch-header!`, so reading a message does not silently
+  mark it read -- that stays an explicit `mark-seen!`. This is the call that
+  lets a mailbox be displayed rather than merely triaged: `fetch-header!`
+  answers who and what about, and never what it says."
+  [session uid]
+  (let [resp (assert-ok! (run-command! session "UID FETCH" (str uid)
+                                       "(BODY.PEEK[])")
+                         "UID FETCH")
+        raw (or (:literal resp) "")
+        parsed (p/split-message raw)]
+    (assoc parsed :uid uid :raw raw :text (p/decode-body parsed))))
+
+(defn list-recent!
+  "The newest `:limit` messages in the selected mailbox, oldest first.
+
+  Newest by UID, which in IMAP ascends with arrival, so the tail of
+  `search-all!` is the recent end of the mailbox without a date search. The
+  fetch is per-UID and therefore bounded by `:limit` (default 50) -- the
+  unbounded part is the UID list, which is integers.
+
+  `:headers-only?` fetches header fields instead of whole messages, for a
+  caller building a list view that will fetch bodies on demand."
+  ([session] (list-recent! session {}))
+  ([session {:keys [limit headers-only?] :or {limit 50}}]
+   (let [uids (take-last limit (search-all! session))]
+     (mapv (fn [uid]
+             (if headers-only?
+               (assoc (fetch-header! session uid) :uid uid)
+               (fetch-message! session uid)))
+           uids))))
+
 (defn mark-seen!
   "UID STORE `uid` +FLAGS.SILENT (\\Seen) -- the ADR-0022 gap this library
   closes: curl-imap-fetch had no way to mark a message read after a
   decision was made on it."
   [session uid]
   (assert-ok! (run-command! session "UID STORE" (str uid) "+FLAGS.SILENT" "(\\Seen)") "UID STORE")
+  true)
+
+(defn mark-unseen!
+  "UID STORE `uid` -FLAGS.SILENT (\\Seen) -- the inverse of `mark-seen!`.
+
+  Present because a mark that cannot be taken off is a trap: an interface
+  offering \"mark as unread\" over a client with only `mark-seen!` has to
+  either lie or keep the difference locally, where the server never learns
+  it and the next client to open the mailbox disagrees."
+  [session uid]
+  (assert-ok! (run-command! session "UID STORE" (str uid) "-FLAGS.SILENT" "(\\Seen)") "UID STORE")
   true)
 
 (defn logout!

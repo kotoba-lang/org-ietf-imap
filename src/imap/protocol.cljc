@@ -6,10 +6,17 @@
   without a socket at all.
 
   Scope is deliberately narrow: enough to log in, select a mailbox,
-  UID SEARCH, UID FETCH a header-fields literal, UID STORE flags, and log
-  out -- the exact shape `imap.client`'s convenience fns need. It does not
-  parse full MIME bodies, IDLE, or general-purpose FETCH data items beyond
-  a single header-fields literal per response."
+  UID SEARCH, UID FETCH a header-fields literal or a whole message, UID
+  STORE flags, and log out -- the exact shape `imap.client`'s convenience
+  fns need. It does not implement IDLE or general-purpose FETCH data items
+  beyond one literal per response.
+
+  It parses a fetched message far enough to separate the header block from
+  the body and to read a single-part body's transfer encoding -- which is
+  what a caller showing a message needs and is not the same as parsing
+  MIME. `decode-body` says out loud where that line is: a multipart message
+  comes back as its raw parts, because picking one out of them is MIME
+  parsing and this library still does not do that."
   (:require [clojure.string :as str]))
 
 (defn command
@@ -77,3 +84,85 @@
                 (assoc acc (keyword (str/lower-case k)) (str/trim v))
                 acc))
             {} lines)))
+
+(defn split-message
+  "A whole RFC 2822 message -> `{:headers {...} :body \"...\"}`.
+
+  The split is the first blank line, which is what separates a header block
+  from a body in RFC 2822 and is the one piece of message structure a caller
+  fetching `BODY.PEEK[]` cannot avoid needing. A message with no blank line
+  is all headers and an empty body, which is what a bodyless message
+  actually is rather than an error."
+  [raw]
+  (let [text (str/replace (str raw) #"\r\n" "\n")
+        [head body] (str/split text #"\n\n" 2)]
+    {:headers (parse-header-block (str/replace (str head) #"\n" "\r\n"))
+     :body (or body "")}))
+
+(defn- qp-bytes
+  "Quoted-printable text -> the byte values it encodes.
+
+  Bytes, not characters. A `=XX` escape is one *byte*, and a non-ASCII
+  character is several of them in a row (`=E6=97=A5` is the three UTF-8
+  bytes of 日) -- so turning each escape into a character as it is met
+  produces one Latin-1 character per byte and mangles every multi-byte
+  character in the message. The decode has to happen over the whole byte
+  sequence at once, which is what this hands to the caller."
+  [text]
+  (let [;; Soft line breaks first: `=` at end of line means "this line
+        ;; continues", and decoding `=XX` before removing them would read
+        ;; the newline that follows as part of a hex pair.
+        text (str/replace (str text) #"=\r?\n" "")
+        n (count text)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (persistent! out)
+        (let [c (nth text i)]
+          (if (and (= \= c) (<= (+ i 3) n)
+                   (re-matches #"[0-9A-Fa-f]{2}" (subs text (inc i) (+ i 3))))
+            (recur (+ i 3)
+                   (conj! out (#?(:clj Long/parseLong :cljs js/parseInt)
+                               (subs text (inc i) (+ i 3)) 16)))
+            (recur (inc i) (conj! out (int c)))))))))
+
+(defn- decode-quoted-printable [text]
+  (let [bytes (qp-bytes text)]
+    #?(:clj (String. (byte-array (map unchecked-byte bytes)) "UTF-8")
+       :cljs (.decode (js/TextDecoder. "utf-8")
+                      (js/Uint8Array.from (clj->js bytes))))))
+
+#?(:clj
+(defn- decode-base64 [text]
+  (try
+    (String. (.decode (java.util.Base64/getMimeDecoder) ^String (str text))
+             "UTF-8")
+    ;; Undecodable base64 is not worth losing the message over: a caller
+    ;; showing mail would rather see the raw text than an exception.
+    (catch Exception _ (str text)))))
+
+(defn content-type
+  "The `Content-Type` header's media type, lower-cased, without parameters."
+  [headers]
+  (some-> (:content-type headers)
+          (str/split #";") first str/trim str/lower-case not-empty))
+
+(defn decode-body
+  "A message body as text, undoing its `Content-Transfer-Encoding`.
+
+  Handles the two encodings that actually carry non-ASCII mail --
+  quoted-printable and base64 -- and passes anything else through, which is
+  correct for 7bit/8bit/binary.
+
+  **Multipart is deliberately not handled**: a `multipart/*` body is
+  returned as its raw parts, boundaries and all. Selecting the text part out
+  of a multipart tree is MIME parsing, this library says in its own docstring
+  that it does not do that, and a version of this that quietly returned the
+  first part would be doing it badly rather than not doing it."
+  [{:keys [headers body]}]
+  (let [encoding (some-> (:content-transfer-encoding headers)
+                         str/trim str/lower-case)]
+    (cond
+      (some-> (content-type headers) (str/starts-with? "multipart/")) body
+      (= "quoted-printable" encoding) (decode-quoted-printable body)
+      #?@(:clj [(= "base64" encoding) (decode-base64 body)])
+      :else body)))
