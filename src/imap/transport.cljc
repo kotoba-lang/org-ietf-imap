@@ -6,7 +6,25 @@
   `read-n!` can satisfy IMAP literals exactly); tests inject a fake
   in-memory `Transport` instead, the same injection shape as
   `cloudflare.client`'s `:http-fn` / `gmail.client`'s `:http-fn`, adapted
-  for a stateful line-oriented protocol instead of one-shot HTTP requests.")
+  for a stateful line-oriented protocol instead of one-shot HTTP requests.
+
+  ## Reads are binary strings, not UTF-8
+
+  Everything read off the wire is decoded **ISO-8859-1**, one byte per
+  character, so character *n* is byte *n*. That is deliberate and it is
+  the contract `kotoba-lang/org-ietf-mime` states for its input.
+
+  A message is bytes, and its parts routinely disagree about what those
+  bytes mean — a UTF-8 body beside an ISO-2022-JP subject beside a PDF.
+  Decoding the whole literal as UTF-8 destroys every part that was not
+  UTF-8, and does it quietly: the result is U+FFFD, not an error. This
+  transport did decode as UTF-8, and the symptom was a Japanese message
+  body arriving as `e1n2WkdDf\\ufffdW~Y` — mojibake that looked like a
+  parser bug three libraries away from the cause.
+
+  Command *writes* stay UTF-8, because a command is text this library
+  composed rather than bytes it received. The one place that matters is
+  `client/append!`, whose literal length is therefore a UTF-8 byte count.")
 
 (defprotocol Transport
   (write! [t s] "Write string `s` (already CRLF-terminated by the caller) to the wire.")
@@ -27,12 +45,12 @@
       (loop []
         (let [b (.read in)]
           (cond
-            (neg? b) (when (pos? (.size buf)) (.toString buf "UTF-8"))
+            (neg? b) (when (pos? (.size buf)) (.toString buf "ISO-8859-1"))
             (= b 10) (let [bytes (.toByteArray buf)
                           len (alength bytes)]
                       (if (and (pos? len) (= (aget bytes (dec len)) (byte 13)))
-                        (String. bytes 0 (dec len) "UTF-8")
-                        (String. bytes 0 len "UTF-8")))
+                        (String. bytes 0 (dec len) "ISO-8859-1")
+                        (String. bytes 0 len "ISO-8859-1")))
             :else (do (.write buf b) (recur)))))))
   (read-n! [_ n]
     (let [buf (byte-array n)]
@@ -40,7 +58,7 @@
         (when (< off n)
           (let [r (.read in buf off (int (- n off)))]
             (when (pos? r) (recur (+ off r))))))
-      (String. buf "UTF-8")))
+      (String. buf "ISO-8859-1")))
   (close! [_] (.close socket))))
 
 #?(:clj

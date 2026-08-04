@@ -282,3 +282,25 @@
                               "A1 OK UID FETCH completed"])]
       (is (= ["one\r\n" "two\r\n"]
              (:literals (#'client/run-command! session "UID FETCH" "1:2" "(BODY.PEEK[])")))))))
+
+(deftest a-literal-is-handed-over-as-bytes-not-as-utf-8-text
+  (testing "org-ietf-mime's input contract, and the bug that motivated it: a
+            message is bytes, its parts disagree about what those bytes mean,
+            and decoding the whole literal as UTF-8 destroys every part that
+            was not UTF-8 -- quietly, as U+FFFD rather than as an error"
+    (let [;; The three UTF-8 bytes of 日, as a binary string: what a
+          ;; latin-1-reading transport hands over.
+          binary (str (char 0xE6) (char 0x97) (char 0xA5))
+          raw (str "Subject: s\r\n\r\n" binary)
+          {:keys [transport]} (fake/make
+                               ["* OK ready"
+                                (str "* 1 FETCH (UID 5 BODY[] {" (count raw) "}")
+                                {:literal raw}
+                                ")"
+                                "A1 OK UID FETCH completed"])
+          session (client/connect! "imap.example.com" {:transport transport})
+          message (client/fetch-message! session 5)]
+      (is (= raw (:raw message))
+          "handed straight through, for org-ietf-mime to decode with the
+           charset each part declares")
+      (is (= 3 (count binary)) "three bytes, three characters -- not one"))))
