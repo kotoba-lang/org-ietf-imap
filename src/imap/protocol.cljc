@@ -5,18 +5,22 @@
   strings and turns response lines back into data, so it's testable
   without a socket at all.
 
-  Scope is deliberately narrow: enough to log in, select a mailbox,
-  UID SEARCH, UID FETCH a header-fields literal or a whole message, UID
-  STORE flags, and log out -- the exact shape `imap.client`'s convenience
-  fns need. It does not implement IDLE or general-purpose FETCH data items
-  beyond one literal per response.
+  ## What this parses, and what it deliberately does not
 
-  It parses a fetched message far enough to separate the header block from
-  the body and to read a single-part body's transfer encoding -- which is
-  what a caller showing a message needs and is not the same as parsing
-  MIME. `decode-body` says out loud where that line is: a multipart message
-  comes back as its raw parts, because picking one out of them is MIME
-  parsing and this library still does not do that."
+  Commands, tagged completions, untagged responses, response codes,
+  flag lists, SEARCH results and literal markers -- the wire syntax of
+  RFC 3501 §7 and §9.
+
+  **It does not parse messages.** A fetched message comes back as the
+  bytes the server sent, and `kotoba-lang/org-ietf-mime` turns those into
+  headers, parts, attachments and decoded text. That library already
+  existed when this one grew whole-message reads, and for one commit this
+  namespace carried its own `split-message` / `decode-body` /
+  quoted-printable decoder instead -- a worse copy of a tested thing,
+  which got multipart wrong (returning the raw parts) where `mime.parse`
+  gets it right (`multipart/alternative` orders worst-to-best, so the
+  *last* match wins). Message format is that library's subject and the
+  wire protocol is this one's."
   (:require [clojure.string :as str]))
 
 (defn command
@@ -85,84 +89,169 @@
                 acc))
             {} lines)))
 
-(defn split-message
-  "A whole RFC 2822 message -> `{:headers {...} :body \"...\"}`.
+;; ------------------------------------------------- untagged responses
+;;
+;; RFC 3501 §7. Everything the server says that is not a tagged completion
+;; arrives as `* ...`, and a client that ignores those cannot know how many
+;; messages a mailbox holds, which flags it accepts, or -- the one that
+;; matters most -- whether the UIDs it cached are still the same UIDs.
 
-  The split is the first blank line, which is what separates a header block
-  from a body in RFC 2822 and is the one piece of message structure a caller
-  fetching `BODY.PEEK[]` cannot avoid needing. A message with no blank line
-  is all headers and an empty body, which is what a bodyless message
-  actually is rather than an error."
-  [raw]
-  (let [text (str/replace (str raw) #"\r\n" "\n")
-        [head body] (str/split text #"\n\n" 2)]
-    {:headers (parse-header-block (str/replace (str head) #"\n" "\r\n"))
-     :body (or body "")}))
+(defn untagged?
+  "True when `line` is an untagged (`*`) response."
+  [line]
+  (str/starts-with? (str line) "* "))
 
-(defn- qp-bytes
-  "Quoted-printable text -> the byte values it encodes.
+(defn parse-flags
+  "A parenthesised flag list -> a set of lower-cased keywords.
 
-  Bytes, not characters. A `=XX` escape is one *byte*, and a non-ASCII
-  character is several of them in a row (`=E6=97=A5` is the three UTF-8
-  bytes of 日) -- so turning each escape into a character as it is met
-  produces one Latin-1 character per byte and mangles every multi-byte
-  character in the message. The decode has to happen over the whole byte
-  sequence at once, which is what this hands to the caller."
-  [text]
-  (let [;; Soft line breaks first: `=` at end of line means "this line
-        ;; continues", and decoding `=XX` before removing them would read
-        ;; the newline that follows as part of a hex pair.
-        text (str/replace (str text) #"=\r?\n" "")
-        n (count text)]
-    (loop [i 0 out (transient [])]
-      (if (>= i n)
-        (persistent! out)
-        (let [c (nth text i)]
-          (if (and (= \= c) (<= (+ i 3) n)
-                   (re-matches #"[0-9A-Fa-f]{2}" (subs text (inc i) (+ i 3))))
-            (recur (+ i 3)
-                   (conj! out (#?(:clj Long/parseLong :cljs js/parseInt)
-                               (subs text (inc i) (+ i 3)) 16)))
-            (recur (inc i) (conj! out (int c)))))))))
+  `\\Seen` becomes `:seen`; a server-defined keyword like `$Forwarded`
+  becomes `:$forwarded`. Lower-cased because RFC 3501 §2.3.2 makes system
+  flags case-insensitive, and two clients disagreeing about `\\SEEN` and
+  `\\Seen` is a bug that only appears against one server."
+  [s]
+  (->> (re-seq #"[\\$]?[A-Za-z0-9_.-]+"
+               (or (second (re-find #"\(([^)]*)\)" (str s))) ""))
+       (map #(keyword (str/lower-case (str/replace % #"^\\" ""))))
+       set))
 
-(defn- decode-quoted-printable [text]
-  (let [bytes (qp-bytes text)]
-    #?(:clj (String. (byte-array (map unchecked-byte bytes)) "UTF-8")
-       :cljs (.decode (js/TextDecoder. "utf-8")
-                      (js/Uint8Array.from (clj->js bytes))))))
+(defn response-code
+  "The `[CODE ...]` a status response may carry (RFC 3501 §7.1).
 
-#?(:clj
-(defn- decode-base64 [text]
-  (try
-    (String. (.decode (java.util.Base64/getMimeDecoder) ^String (str text))
-             "UTF-8")
-    ;; Undecodable base64 is not worth losing the message over: a caller
-    ;; showing mail would rather see the raw text than an exception.
-    (catch Exception _ (str text)))))
+  -> `{:code :uidvalidity :value \"1\"}`, or nil. The code is what turns
+  an `OK` into information: `[UIDVALIDITY 1]`, `[PERMANENTFLAGS (...)]`,
+  `[READ-ONLY]`, `[ALERT]`."
+  [line]
+  (when-let [[_ body] (re-find #"\[([^\]]*)\]" (str line))]
+    (let [[code value] (str/split (str/trim body) #"\s+" 2)]
+      (when (seq code)
+        {:code (keyword (str/lower-case code)) :value value}))))
 
-(defn content-type
-  "The `Content-Type` header's media type, lower-cased, without parameters."
-  [headers]
-  (some-> (:content-type headers)
-          (str/split #";") first str/trim str/lower-case not-empty))
+(defn parse-untagged
+  "One untagged line -> a fact about the mailbox or the session.
 
-(defn decode-body
-  "A message body as text, undoing its `Content-Transfer-Encoding`.
-
-  Handles the two encodings that actually carry non-ASCII mail --
-  quoted-printable and base64 -- and passes anything else through, which is
-  correct for 7bit/8bit/binary.
-
-  **Multipart is deliberately not handled**: a `multipart/*` body is
-  returned as its raw parts, boundaries and all. Selecting the text part out
-  of a multipart tree is MIME parsing, this library says in its own docstring
-  that it does not do that, and a version of this that quietly returned the
-  first part would be doing it badly rather than not doing it."
-  [{:keys [headers body]}]
-  (let [encoding (some-> (:content-transfer-encoding headers)
-                         str/trim str/lower-case)]
+  Returns nil for lines this does not model, which is most of them: a
+  caller folds what it recognises and is not obliged to understand the
+  rest. That is what RFC 3501 §7 asks for -- a client must tolerate
+  untagged responses it did not request and cannot interpret."
+  [line]
+  (let [line (str line)]
     (cond
-      (some-> (content-type headers) (str/starts-with? "multipart/")) body
-      (= "quoted-printable" encoding) (decode-quoted-printable body)
-      #?@(:clj [(= "base64" encoding) (decode-base64 body)])
-      :else body)))
+      (not (untagged? line)) nil
+
+      (re-matches #"\* (\d+) (EXISTS|RECENT|EXPUNGE)" line)
+      (let [[_ n kind] (re-matches #"\* (\d+) (EXISTS|RECENT|EXPUNGE)" line)]
+        {:type (keyword (str/lower-case kind)) :value (parse-long n)})
+
+      (str/starts-with? line "* FLAGS")
+      {:type :flags :value (parse-flags line)}
+
+      (str/starts-with? line "* CAPABILITY")
+      {:type :capability
+       :value (->> (str/split (subs line (count "* CAPABILITY")) #"\s+")
+                   (remove str/blank?)
+                   (map str/upper-case)
+                   set)}
+
+      (re-matches #"\* (?:LIST|LSUB) .*" line)
+      (when-let [[_ attrs delimiter name-part]
+                 (re-matches #"\* (?:LIST|LSUB) \(([^)]*)\) (\"[^\"]*\"|NIL) (.*)" line)]
+        {:type :list
+         :attributes (parse-flags (str "(" attrs ")"))
+         :delimiter (when (not= "NIL" delimiter)
+                      (str/replace delimiter "\"" ""))
+         :name (-> name-part str/trim (str/replace #"^\"|\"$" ""))})
+
+      (str/starts-with? line "* STATUS")
+      {:type :status
+       :value (->> (str/split (str/trim (or (second (re-find #"\(([^)]*)\)\s*$" line)) ""))
+                              #"\s+")
+                   (remove str/blank?)
+                   (partition 2)
+                   (into {} (map (fn [[k v]]
+                                   [(keyword (str/lower-case k))
+                                    (or (parse-long v) v)]))))}
+
+      (re-matches #"\* (\d+) FETCH .*" line)
+      (let [[_ n] (re-matches #"\* (\d+) FETCH .*" line)]
+        (cond-> {:type :fetch :sequence (parse-long n)}
+          (re-find #"UID (\d+)" line)
+          (assoc :uid (parse-long (second (re-find #"UID (\d+)" line))))
+          (re-find #"FLAGS \(([^)]*)\)" line)
+          (assoc :flags (parse-flags (str "(" (second (re-find #"FLAGS \(([^)]*)\)" line)) ")")))
+          (re-find #"RFC822\.SIZE (\d+)" line)
+          (assoc :size (parse-long (second (re-find #"RFC822\.SIZE (\d+)" line))))
+          (re-find #"INTERNALDATE \"([^\"]*)\"" line)
+          (assoc :internal-date (second (re-find #"INTERNALDATE \"([^\"]*)\"" line)))))
+
+      (re-matches #"\* (OK|NO|BAD|BYE|PREAUTH)\b.*" line)
+      (let [[_ status] (re-matches #"\* (OK|NO|BAD|BYE|PREAUTH)\b.*" line)
+            {:keys [code value]} (response-code line)]
+        (cond-> {:type (keyword (str/lower-case status))}
+          code (assoc :code code :value value)
+          (= :permanentflags code) (assoc :value (parse-flags line))))
+
+      :else nil)))
+
+(defn mailbox-state
+  "Fold the untagged lines of a SELECT/EXAMINE into what the mailbox is.
+
+  `:uidvalidity` is the one that must not be dropped. RFC 3501 §2.3.1.1:
+  a UID is only meaningful together with the UIDVALIDITY it was issued
+  under, and when a server changes that value every cached UID now means
+  a different message, or none. A client that stores UIDs and never reads
+  UIDVALIDITY will, on the day a mailbox is rebuilt, quietly show one
+  message under another's identity."
+  [lines]
+  (reduce (fn [acc line]
+            (let [{:keys [type code value]} (parse-untagged line)]
+              (cond
+                (= :exists type) (assoc acc :exists value)
+                (= :recent type) (assoc acc :recent value)
+                (= :flags type) (assoc acc :flags value)
+                (= :capability type) (assoc acc :capabilities value)
+                (= :uidvalidity code) (assoc acc :uidvalidity (parse-long (str value)))
+                (= :uidnext code) (assoc acc :uidnext (parse-long (str value)))
+                (= :permanentflags code) (assoc acc :permanent-flags value)
+                (= :unseen code) (assoc acc :unseen (parse-long (str value)))
+                (= :read-only code) (assoc acc :read-only? true)
+                (= :read-write code) (assoc acc :read-only? false)
+                :else acc)))
+          {}
+          lines))
+
+;; ------------------------------------------------------ authentication
+
+(def ^:private nul "\u0000")
+
+(defn base64
+  "Base64 for a SASL payload.
+
+  A SASL payload carries NUL bytes and, for XOAUTH2, an OAuth token; both
+  reach the wire only through this. Delegated to the host encoder rather
+  than written out, because the platform's is already correct -- the same
+  call `org-ietf-smtp` makes, for the same reason."
+  [s]
+  #?(:clj (.encodeToString (java.util.Base64/getEncoder)
+                           (.getBytes (str s) "UTF-8"))
+     :cljs (.toString (js/Buffer.from (str s) "utf-8") "base64")))
+
+(defn plain-credentials
+  "SASL PLAIN (RFC 4616): `NUL user NUL pass`, for the caller to base64.
+
+  The leading NUL is the authorization identity, empty because a client
+  authenticating as itself does not assume another one. Omitting that
+  field entirely is the classic PLAIN bug, and servers reject the result
+  with a message that says nothing about which of the three was missing."
+  [user pass]
+  (str nul user nul pass))
+
+(defn xoauth2-credentials
+  "The XOAUTH2 SASL payload, for the caller to base64.
+
+  Not an IETF mechanism -- it is Google's, and Microsoft accepts the same
+  shape -- but it is how an OAuth grant reaches IMAP at all. Without it,
+  an OAuth-connected mailbox has to ask its owner for a second credential
+  in the form of an app password, to read a mailbox the first credential
+  already authorises."
+  [user access-token]
+  (str "user=" user nul "auth=Bearer " access-token nul nul))

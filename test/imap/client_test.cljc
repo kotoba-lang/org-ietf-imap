@@ -1,7 +1,9 @@
 (ns imap.client-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [imap.client :as client]
-            [imap.fake-transport :as fake]))
+            [imap.fake-transport :as fake]
+            [imap.protocol :as p]))
 
 (deftest connect-reads-the-greeting-and-throws-on-a-bad-one
   (let [{:keys [transport]} (fake/make ["* OK IMAP4rev1 Service Ready"])]
@@ -75,76 +77,208 @@
          #"LOGIN failed"
          (client/login! session "u" "wrong")))))
 
-;; --- whole-message reads ---------------------------------------------------
+;; --- RFC 3501 coverage -----------------------------------------------------
 
-(deftest fetch-message-returns-headers-body-and-decoded-text
-  (let [raw (str "From: a@example.com\r\nSubject: hi\r\n"
-                 "Content-Transfer-Encoding: quoted-printable\r\n\r\n"
-                 "caf=C3=A9\r\n")
-        script ["* OK ready"
-                (str "* 1 FETCH (UID 5 BODY[] {" (count raw) "}")
-                {:literal raw}
-                ")"
-                "A1 OK UID FETCH completed"]
-        {:keys [transport written]} (fake/make script)
-        session (client/connect! "imap.example.com" {:transport transport})
-        message (client/fetch-message! session 5)]
-    (is (= 5 (:uid message)))
-    (is (= "a@example.com" (get-in message [:headers :from])))
-    (is (= "café\n" (:text message)) "the body with its transfer encoding undone")
-    (is (= raw (:raw message)) "what the server actually sent is kept too")
-    (testing "BODY.PEEK, so reading a message does not silently mark it read"
-      (is (= ["A1 UID FETCH 5 (BODY.PEEK[])\r\n"] @written)))))
+(defn- session-after [script]
+  (let [{:keys [transport written]} (fake/make script)]
+    {:session (client/connect! "imap.example.com" {:transport transport})
+     :written written}))
 
-(deftest list-recent-takes-the-newest-uids-and-fetches-those
-  (let [body-for (fn [n] (str "Subject: m" n "\r\n\r\nbody" n "\r\n"))
-        script (concat
-                ["* OK ready"
-                 "* SEARCH 1 2 3 4"
-                 "A1 OK UID SEARCH completed"]
-                (mapcat (fn [uid tag]
-                          [(str "* 1 FETCH (UID " uid " BODY[] {" (count (body-for uid)) "}")
-                           {:literal (body-for uid)}
-                           ")"
-                           (str tag " OK UID FETCH completed")])
-                        [3 4] ["A2" "A3"]))
-        {:keys [transport written]} (fake/make script)
-        session (client/connect! "imap.example.com" {:transport transport})
-        messages (client/list-recent! session {:limit 2})]
-    (testing "the newest two by UID, oldest of those first"
-      (is (= [3 4] (mapv :uid messages)))
-      (is (= ["body3\n" "body4\n"] (mapv :text messages))))
-    (testing "the UID list is unbounded but only :limit messages are fetched"
-      (is (= ["A1 UID SEARCH ALL\r\n"
-              "A2 UID FETCH 3 (BODY.PEEK[])\r\n"
-              "A3 UID FETCH 4 (BODY.PEEK[])\r\n"]
-             @written)))))
+(deftest select-returns-uidvalidity-rather-than-discarding-it
+  (testing "a sync that caches UIDs across sessions and never reads
+            UIDVALIDITY is correct until a server reissues it, after which
+            every cached UID names a different message"
+    (let [{:keys [session]} (session-after
+                             ["* OK ready"
+                              "* 172 EXISTS"
+                              "* 1 RECENT"
+                              "* FLAGS (\\Answered \\Seen)"
+                              "* OK [UIDVALIDITY 3857529045] UIDs valid"
+                              "* OK [UIDNEXT 4392] Predicted next UID"
+                              "A1 OK [READ-WRITE] SELECT completed"])
+          selected (client/select! session "INBOX")]
+      (is (= 3857529045 (get-in selected [:mailbox :uidvalidity])))
+      (is (= 4392 (get-in selected [:mailbox :uidnext])))
+      (is (= 172 (get-in selected [:mailbox :exists])))
+      (is (= "INBOX" (get-in selected [:mailbox :name])))
+      (is (false? (get-in selected [:mailbox :read-only?]))))))
 
-(deftest list-recent-headers-only-skips-the-body-fetch
-  (let [header "From: a@example.com\r\n"
-        script ["* OK ready"
-                "* SEARCH 9"
-                "A1 OK UID SEARCH completed"
-                (str "* 1 FETCH (UID 9 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)] {"
-                     (count header) "}")
-                {:literal header}
-                ")"
-                "A2 OK UID FETCH completed"]
-        {:keys [transport written]} (fake/make script)
-        session (client/connect! "imap.example.com" {:transport transport})]
-    (is (= [{:from "a@example.com" :uid 9}]
-           (client/list-recent! session {:headers-only? true})))
-    (is (= "A2 UID FETCH 9 (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])\r\n"
-           (second @written)))))
+(deftest examine-opens-a-mailbox-that-cannot-be-written
+  (testing "the right call for a read-only sync: it cannot set \\Seen by
+            accident, and on a shared mailbox that accident is visible to
+            everybody else looking at it"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready"
+                                      "* OK [UIDVALIDITY 1] ok"
+                                      "A1 OK [READ-ONLY] EXAMINE completed"])
+          examined (client/examine! session "INBOX")]
+      (is (true? (get-in examined [:mailbox :read-only?])))
+      (is (= ["A1 EXAMINE \"INBOX\"\r\n"] @written)))))
 
-(deftest search-passes-criteria-through-verbatim
-  (let [{:keys [transport written]} (fake/make ["* OK ready" "* SEARCH" "A1 OK UID SEARCH completed"])
-        session (client/connect! "imap.example.com" {:transport transport})]
-    (is (= [] (client/search! session "SINCE 1-Jan-2026")))
-    (is (= ["A1 UID SEARCH SINCE 1-Jan-2026\r\n"] @written))))
+(deftest capabilities-are-asked-for-rather-than-assumed
+  (let [{:keys [session]} (session-after
+                           ["* OK ready"
+                            "* CAPABILITY IMAP4rev1 IDLE MOVE AUTH=XOAUTH2"
+                            "A1 OK CAPABILITY completed"])
+        with-caps (client/capabilities! session)]
+    (is (client/supports? with-caps "IDLE"))
+    (is (client/supports? with-caps "move") "case-insensitive")
+    (is (not (client/supports? with-caps "CONDSTORE")))))
 
-(deftest mark-unseen-clears-the-flag-mark-seen-sets
-  (let [{:keys [transport written]} (fake/make ["* OK ready" "A1 OK UID STORE completed"])
-        session (client/connect! "imap.example.com" {:transport transport})]
-    (is (true? (client/mark-unseen! session 5)))
-    (is (= ["A1 UID STORE 5 -FLAGS.SILENT (\\Seen)\r\n"] @written))))
+(deftest authenticate-plain-sends-the-payload-on-the-continuation
+  (testing "SASL-IR (RFC 4959) lets the payload ride on the command line and
+            not every server has it, so the two-step form is the portable one"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready"
+                                      "+ "
+                                      "A1 OK AUTHENTICATE completed"])]
+      (client/authenticate-plain! session "me@example.com" "secret")
+      (is (= "A1 AUTHENTICATE PLAIN\r\n" (first @written)))
+      (is (= (str (p/base64 (str (char 0) "me@example.com" (char 0) "secret")) "\r\n")
+             (second @written))))))
+
+(deftest authenticate-xoauth2-lets-an-oauth-grant-reach-imap
+  (testing "without it, a mailbox already connected by OAuth has to ask its
+            owner for an app password to read what the grant already covers"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "+ " "A1 OK AUTHENTICATE completed"])]
+      (client/authenticate-xoauth2! session "me@example.com" "ya29.token")
+      (is (= "A1 AUTHENTICATE XOAUTH2\r\n" (first @written))))))
+
+(deftest store-flags-writes-more-than-seen
+  (testing "starring, drafting and answering were all unreachable while
+            \\Seen was the only flag this could write"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "A1 OK UID STORE completed"])]
+      (client/store-flags! session 5 :add [:flagged :answered])
+      (is (= ["A1 UID STORE 5 +FLAGS.SILENT (\\Flagged \\Answered)\r\n"] @written))))
+  (testing "a server keyword takes no backslash"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "A1 OK UID STORE completed"])]
+      (client/store-flags! session 5 :set ["$Forwarded"])
+      (is (= ["A1 UID STORE 5 FLAGS.SILENT ($Forwarded)\r\n"] @written)))))
+
+(deftest fetch-flags-reads-what-is-already-marked
+  (let [{:keys [session]} (session-after
+                           ["* OK ready"
+                            "* 12 FETCH (UID 5 FLAGS (\\Seen \\Flagged))"
+                            "A1 OK UID FETCH completed"])]
+    (is (= #{:seen :flagged} (client/fetch-flags! session 5)))))
+
+(deftest fetch-message-returns-raw-bytes-for-mime-to-parse
+  (testing "message format is org-ietf-mime's subject; this library carried a
+            worse copy of it for one commit and got multipart wrong"
+    (let [raw "From: a@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+          {:keys [session]} (session-after
+                             ["* OK ready"
+                              (str "* 12 FETCH (UID 5 FLAGS (\\Seen) RFC822.SIZE 42 BODY[] {"
+                                   (count raw) "}")
+                              {:literal raw}
+                              ")"
+                              "A1 OK UID FETCH completed"])
+          message (client/fetch-message! session 5)]
+      (is (= raw (:raw message)))
+      (is (= 5 (:uid message)))
+      (testing "flags and size ride along on the same FETCH rather than
+                costing a second round trip"
+        (is (= #{:seen} (:flags message)))
+        (is (= 42 (:size message))))
+      (is (nil? (:body message)) "no half-parsed body any more"))))
+
+(deftest list-finds-the-sent-folder-by-its-special-use-flag
+  (let [{:keys [session]} (session-after
+                           ["* OK ready"
+                            "* LIST (\\HasNoChildren) \"/\" \"INBOX\""
+                            "* LIST (\\HasNoChildren \\Sent) \"/\" \"INBOX/Sent\""
+                            "A1 OK LIST completed"])
+        boxes (client/list-mailboxes! session)]
+    (is (= ["INBOX" "INBOX/Sent"] (mapv :name boxes)))
+    (is (= "INBOX/Sent"
+           (:name (first (filter #(contains? (:attributes %) :sent) boxes)))))))
+
+(deftest status-asks-about-a-mailbox-without-selecting-it
+  (testing "the only way to poll several folders without disturbing the
+            selected one"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready"
+                                      "* STATUS \"INBOX/Sent\" (MESSAGES 3 UNSEEN 0)"
+                                      "A1 OK STATUS completed"])]
+      (is (= {:messages 3 :unseen 0} (client/status! session "INBOX/Sent")))
+      (is (str/starts-with? (first @written) "A1 STATUS \"INBOX/Sent\" (")))))
+
+(deftest append-puts-a-sent-message-into-sent
+  (testing "without it, mail this app sends exists at the recipient and
+            nowhere in the sender's own mailbox, so every other client shows
+            an empty Sent folder"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "+ go ahead" "A1 OK APPEND completed"])]
+      (client/append! session "INBOX/Sent" "From: a@b\r\n\r\nhi" {:flags [:seen]})
+      (testing "the literal is the message's 15 bytes; the CRLF that follows
+                terminates the command and is not part of it"
+        (is (= "A1 APPEND \"INBOX/Sent\" (\\Seen) {15}\r\n" (first @written)))
+        (is (= "From: a@b\r\n\r\nhi\r\n" (second @written)))))))
+
+(deftest append-announces-a-byte-count-not-a-character-count
+  (testing "for a message with any non-ASCII in it those differ, and
+            announcing the shorter one truncates the message and leaves the
+            connection out of step with the protocol"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "+ ok" "A1 OK APPEND completed"])
+          body "From: a@b\r\n\r\n日本語"]
+      (client/append! session "Sent" body)
+      (is (= "A1 APPEND \"Sent\" {22}\r\n" (first @written))
+          "13 header bytes + 9 bytes of UTF-8 for three characters"))))
+
+(deftest move-falls-back-to-copy-when-the-server-has-no-move
+  (testing "and says the fallback is not equivalent, rather than expunging
+            behind the caller's back -- EXPUNGE removes every deleted message
+            in the mailbox, not just this one"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready"
+                                      "A1 OK UID COPY completed"
+                                      "A2 OK UID STORE completed"])
+          result (client/move! session 5 "Archive")]
+      (is (true? (:expunge-required? result)))
+      (is (= ["A1 UID COPY 5 \"Archive\"\r\n"
+              "A2 UID STORE 5 +FLAGS.SILENT (\\Deleted)\r\n"]
+             @written))))
+  (testing "and uses MOVE where the server advertises it"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "A1 OK UID MOVE completed"])
+          with-caps (assoc session :capabilities #{"MOVE"})
+          result (client/move! with-caps 5 "Archive")]
+      (is (false? (:expunge-required? result)))
+      (is (= ["A1 UID MOVE 5 \"Archive\"\r\n"] @written)))))
+
+(deftest idle-always-sends-done
+  (testing "a connection left in IDLE accepts no further commands, so DONE
+            has to survive the caller stopping early"
+    (let [{:keys [session written]} (session-after
+                                     ["* OK ready" "+ idling" "* 1 EXISTS"
+                                      "A1 OK IDLE terminated"])
+          with-caps (assoc session :capabilities #{"IDLE"})
+          events (client/idle! with-caps (fn [_] false))]
+      (is (= ["* 1 EXISTS"] events))
+      (is (= "DONE\r\n" (last @written))))))
+
+(deftest idle-refuses-where-the-server-does-not-advertise-it
+  (let [{:keys [session]} (session-after ["* OK ready"])]
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+         #"IDLE"
+         (client/idle! session (fn [_] false))))))
+
+(deftest two-literals-in-one-response-are-both-kept
+  (testing "a response carrying two literals used to overwrite the first with
+            the second, so a fetch of two messages returned the second twice"
+    (let [{:keys [session]} (session-after
+                             ["* OK ready"
+                              "* 1 FETCH (UID 1 BODY[] {5}"
+                              {:literal "one\r\n"}
+                              ")"
+                              "* 2 FETCH (UID 2 BODY[] {5}"
+                              {:literal "two\r\n"}
+                              ")"
+                              "A1 OK UID FETCH completed"])]
+      (is (= ["one\r\n" "two\r\n"]
+             (:literals (#'client/run-command! session "UID FETCH" "1:2" "(BODY.PEEK[])")))))))
